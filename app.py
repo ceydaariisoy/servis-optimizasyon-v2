@@ -19,9 +19,16 @@ from core import (
     reverse_routes_for_return,
     update_routes_incrementally,
 )
+from route_safety import (
+    MAX_WALK_METERS,
+    WalkingMatrix,
+    optimize_major_road_stops,
+    certify_assigned_routes,
+    ValidationError,
+)
 
 
-APP_VERSION = "2026.09.24-final-stable-v8"
+APP_VERSION = "2026.10-major-road-pedestrian-v1"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -559,6 +566,7 @@ AUTOMATIC_STOP_SOURCES = {
     "Otomatik ortak nokta",
     "Güzergâh üzeri aday durak",
     "Güzergâha yakın yeni durak",
+    "Ana yol adayı (saha kontrolü gerekli)",
 }
 
 
@@ -627,6 +635,7 @@ def professional_stop_source(source: object) -> str:
         "Otomatik ortak nokta": "Yeni Ortak Durak Önerisi",
         "Güzergâh üzeri aday durak": "Yeni Güzergâh Durağı Önerisi",
         "Güzergâha yakın yeni durak": "Yeni Güzergâh Durağı Önerisi",
+        "Ana yol adayı (saha kontrolü gerekli)": "Ana Yol Durağı Önerisi (Saha Onayı Gerekli)",
     }
     return mapping.get(source, source)
 
@@ -793,6 +802,9 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple], dict]:
         if status in {"uygun_degil", "reddedildi", "red", "hayir", "kullanilmayacak"}:
             stats["excluded"] += 1
             continue
+        if status not in {"onaylandi", "onayli", "evet", "uygun"}:
+            stats["pending"] += 1
+            continue
         label = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else f"Yüklenen durak {row_no}"
         route_group = str(row[route_col]).strip() if route_col and not pd.isna(row[route_col]) else ""
         # Dördüncü alan mevcut rota bilgisidir. core.py bu bilgiyi yalnızca
@@ -803,7 +815,7 @@ def read_approved_candidates(uploaded_file) -> tuple[list[tuple], dict]:
             stats["approved"] += 1
         else:
             stats["pending"] += 1
-    if not candidates and not stats["excluded"]:
+    if not candidates and not stats["excluded"] and not stats["pending"]:
         raise ValueError("Durak dosyasında geçerli koordinat bulunamadı.")
     return candidates, stats
 
@@ -1342,36 +1354,26 @@ def build_shared_routes(
     # ---------------------------------------------------------
     # 1) ADAY DURAKLARI OLUŞTUR
     # ---------------------------------------------------------
-    candidates = generate_candidate_stops(
+    if max_walk_m != 1000:
+        raise ValidationError("Azami gerçek yürüme mesafesi sabit 1000 m olmalıdır.")
+    if not use_road_network:
+        raise ValidationError("Güvenli planlama için OSRM araç yol ağı zorunludur.")
+    walking_router = WalkingMatrix()
+    all_stops, candidates, minimum_proven, excluded_roads = optimize_major_road_stops(
         employee_coordinates,
-        max_walk_m=max_walk_m,
-        walking_factor=1.20,
-        approved_candidates=approved_candidates,
-        allow_automatic_candidates=allow_automatic_candidates,
-        factory_coordinates=factory_coordinates,
-    )
-
-    # ---------------------------------------------------------
-    # 2) ÇALIŞANLARI DURAKLARA ATA
-    # ---------------------------------------------------------
-    all_stops, minimum_stop_count, minimum_proven = optimize_candidate_stops(
-        employee_coordinates,
-        candidates,
-        max_walk_m=max_walk_m,
+        approved_candidates,
+        capacity=capacity,
+        allow_automatic=allow_automatic_candidates,
         target_average_walk_m=target_average_walk_m,
-        walking_factor=1.20,
+        walking=walking_router,
     )
-
-    # Yürüme sınırı içinde yüklenen/mevcut durak bulunan çalışanlar
-    # mutlaka en yakın yüklenen durağa alınır.
-    all_stops = enforce_nearest_loaded_stop_assignments(
-        stops=all_stops,
-        employee_coordinates=employee_coordinates,
-        approved_candidates=approved_candidates,
-        max_walk_m=max_walk_m,
-        walking_factor=1.20,
-    )
-
+    minimum_stop_count = len({(s.latitude, s.longitude) for s in all_stops})
+    # The certified optimum concerns a joint stop + walking objective, not
+    # a proof of globally minimum number of physical stops.
+    joint_objective_proven = minimum_proven
+    minimum_proven = False
+    # A large common stop may be visited by several buses; no vehicle
+    # is assigned more than its own capacity.
     if not all_stops and len(employees):
         raise ValueError(
             "Çalışanlar için yürüme sınırı içinde uygun servis durağı bulunamadı."
@@ -1414,6 +1416,11 @@ def build_shared_routes(
         route_coordinates,
         use_road_network=use_road_network,
     )
+
+    if matrix_source != "OSRM yol ağı":
+        raise ValidationError(
+            "Araç yol ağı doğrulanamadı; kuş uçuşu tahminine geçildiği için plan yayınlanmadı."
+        )
 
     # ---------------------------------------------------------
     # 4) ARAÇ SAYISI
@@ -1543,14 +1550,11 @@ def build_shared_routes(
     # ---------------------------------------------------------
     # Ana OR-Tools rota dağılımını değiştirmiyoruz. Yalnızca AYNI rota içindeki
     # yakın durakları; yürüme sınırı ve iki yönlü süre korunuyorsa birleştiriyoruz.
-    allocated_routes, consolidation_meta = consolidate_allocated_routes(
-        routes=allocated_routes,
-        employee_coordinates=employee_coordinates,
-        duration_matrix=duration_matrix,
-        max_walk_m=max_walk_m,
-        wait_seconds_per_stop=wait_seconds_per_stop,
-        max_route_minutes=max_route_minutes,
-        walking_factor=1.20,
+    # Existing stop consolidation uses air-distance*1.2. It is disabled
+    # until a pedestrian-network-safe merge algorithm is available.
+    consolidation_meta = {"merged_stop_count": 0, "moved_employee_count": 0, "route_merge_counts": []}
+    experience_meta = certify_assigned_routes(
+        allocated_routes, employee_coordinates, walking=walking_router, max_walk_m=1000
     )
 
     # ---------------------------------------------------------
@@ -1618,9 +1622,29 @@ def build_shared_routes(
             "ve sabah/akşam rota süresini artırmadı."
         )
 
+    warnings.append(
+        f"Yaya yol ağı doğrulaması: en uzun yürüyüş {experience_meta['max_walk_m']:.0f} m, "
+        f"ortalama {experience_meta['avg_walk_m']:.0f} m (sert sınır 1000 m)."
+    )
+    if excluded_roads:
+        warnings.append(f"Ana yol kontrolünü geçmeyen {len(excluded_roads)} yüklenen durak elendi.")
+    if any(stop.source.startswith("Ana yol adayı") for stop in all_stops):
+        warnings.append(
+            "OTOMATİK ANA YOL NOKTALARI SADECE ÖNERİDİR. Kaldırım, güvenli bekleme "
+            "alanı, geçit, otobüs dönüşü ve araç ölçüleri sahada onaylanmadan uygulanamaz."
+        )
+    warnings.append(
+        "OSRM driving profili büyük servis geometrisini, dönüş çapını ve tonaj/" 
+        "yükseklik kısıtlarını kanıtlamaz. Güzergâh sahada servis aracıyla doğrulanmalıdır."
+    )
     meta = {
         "vehicle_count": len(allocated_routes),
         "candidate_count": len(candidates),
+        "joint_objective_proven": joint_objective_proven,
+        "pedestrian_verified": True,
+        "road_class_screened": True,
+        "max_network_walk_m": experience_meta["max_walk_m"],
+        "avg_network_walk_m": experience_meta["avg_walk_m"],
         "minimum_stop_count": minimum_stop_count,
         "minimum_proven": minimum_proven,
         "selected_stop_count": sum(len(route) for route in allocated_routes),
@@ -1664,6 +1688,11 @@ def build_incremental_shared_routes(
     allow_automatic_candidates: bool,
 ):
     """Mevcut planı günceller; rota grubu geliş/dönüşte aynı kalır."""
+    raise ValidationError(
+        "Mevcut planı koruma modu gerçek yaya mesafesiyle henüz uyumlu değil. "
+        "Sert 1000 m güvenlik şartını korumak için Tam optimizasyonu seçin."
+    )
+
     employee_coordinates = list(
         zip(employees["Enlem"].astype(float), employees["Boylam"].astype(float))
     )
@@ -1820,16 +1849,16 @@ with st.sidebar:
     with st.expander("Planlama modeli", expanded=True):
         planning_label = st.selectbox(
             "Planlama yaklaşımı",
-            ["Tam optimizasyon", "Mevcut planı koruyarak güncelle"],
+            ["Tam optimizasyon"],
             help=(
-                "Tam optimizasyon bütün planı yeniden kurar. Mevcut planı koruma modu "
-                "önce yeni çalışanı mevcut durağa ekler ve yalnızca gerekirse yeni durak/rota açar."
+                "Tam optimizasyon yol ve yaya ağı kontrolleriyle yeni planı oluşturur. "
+                "Eski planı koruma modu, gerçek yaya ağına uyarlanana kadar kapalıdır."
             ),
         )
         mode_label = st.selectbox(
             "Rota sayısı",
             ["Otomatik (kapasite + süreye göre)", "Sabit 3 servis"],
-            index=1,
+            index=0,
         )
         if mode_label.startswith("Sabit 3"):
             st.caption(
@@ -1844,11 +1873,9 @@ with st.sidebar:
                 "Yalnızca yüklenen durakları kullan",
             ],
             help=(
-                "Sistem önce yürüme sınırı içindeki en yakın mevcut/yüklenen durağı kullanır. "
-                "Mevcut durağa yürüyemiyorsa ortak güzergâh noktası arar; gerekirse tekil "
-                "koridor/sapma durağı açar. Rota oluşturulduktan sonra aynı rota içindeki "
-                "çok yakın duraklar yalnızca küçük ek yürüyüşle ve rota süresini artırmadan "
-                "birleştirilebilir. Çalışan adresi doğrudan servis durağı olarak kullanılmaz."
+                "Önce saha onaylı ana yol durakları değerlendirilir; yetersiz kalırsa "
+                "ana yollar üzerinden yeni ortak durak önerilir. Otomatik öneriler uygulama "
+                "öncesi saha kontrolüne tabidir. Gerçek yaya yolunda 1.000 m sınırdır."
             ),
         )
 
@@ -1860,15 +1887,8 @@ with st.sidebar:
             value=45,
             step=1,
         )
-        max_walk_m = st.slider(
-            "Azami yürüme mesafesi",
-            min_value=200,
-            max_value=1200,
-            value=1000,
-            step=50,
-            format="%d m",
-            help="Yakın çalışanlar bu sınırı aşmayacak biçimde ortak bir durakta toplanır.",
-        )
+        max_walk_m = 1000
+        st.caption("🔒 Gerçek yaya yoluna göre maksimum 1.000 metre (değiştirilemez).")
         target_average_walk_m = min(FIXED_TARGET_AVERAGE_WALK_M, int(max_walk_m))
         max_route_minutes = st.slider(
             "Azami rota süresi",
@@ -1902,16 +1922,17 @@ with st.sidebar:
                 "Operasyonel hedef 70 dk olarak belirlendi. Daha yüksek bir sınır seçildiğinde "
                 "sistem 70 dk üzerindeki çözümleri de kabul edebilir."
             )
-        use_road_network = st.checkbox("Gerçek yol güzergâhını kullan", value=True)
-        road_consent = False
-        if use_road_network:
-            road_consent = st.checkbox(
-                "Koordinatların yol hesabı için paylaşılmasını onaylıyorum",
-                help=(
-                    "Yalnızca koordinatlar açık OSRM servisine gönderilir. "
-                    "İsim, sicil ve açık adres paylaşılmaz."
-                ),
-            )
+        # Road-network distances are mandatory; there is no approximate mode.
+        use_road_network = True
+        st.caption("🔒 Araç yol ağı + yaya yol ağı zorunludur; yaklaşık mesafe ile plan üretilmez.")
+        road_consent = st.checkbox(
+            "Koordinatların harita servislerine gönderilmesini onaylıyorum",
+            help=(
+                "Çalışan ve durak koordinatları araç OSRM ve yaya OSRM sunucularına; "
+                "sorgu bölgesinin sınırları Overpass sunucusuna gider. "
+                "İsim, sicil ve açık adres gönderilmez."
+            ),
+        )
 
     st.markdown(
         """
@@ -1943,7 +1964,7 @@ with upload_right:
         type=["xlsx", "xls"],
         help=(
             "Durak_Adi, Enlem ve Boylam sütunlarını içeren dosyadır. Saha_Onayi sütununda "
-            "Uygun Değil/Reddedildi olan satırlar kullanılmaz; Bekliyor olanlar yalnızca adaydır."
+            "Yalnızca Saha_Onayi=Onaylı/Uygun/Evet olan duraklar kullanılır; diğerleri dışlanır."
         ),
     )
 previous_plan_file = None
@@ -2014,12 +2035,12 @@ c1.metric("Aktif servis kullanıcısı", len(employees))
 c2.metric("Eksik çalışan koordinatı", int(employees[["Enlem", "Boylam"]].isna().any(axis=1).sum()))
 c3.metric("Kapasiteye göre minimum", math.ceil(len(employees) / int(capacity)) if len(employees) else 0)
 c4.metric("Kullanılabilir durak", approved_count)
-if approved_count:
-    candidate_stats = st.session_state.get("approved_candidate_stats", {})
+candidate_stats = st.session_state.get("approved_candidate_stats", {})
+if approved_stop_file is not None:
     st.caption(
-        f"{approved_count} yüklenmiş durak bulundu: "
-        f"{candidate_stats.get('approved', 0)} saha onaylı, "
-        f"{candidate_stats.get('pending', approved_count)} onay bekliyor. "
+        f"{approved_count} saha onaylı durak kullanılabilecek, "
+        f"{candidate_stats.get('pending', 0)} onay beklediği için kullanılmayacak, "
+        f"{candidate_stats.get('excluded', 0)} reddedilmiş durak dışlanacak. "
         + (
             "Bunlara ek olarak gerektiğinde otomatik güzergâh adayları da değerlendirilecek."
             if allow_automatic_candidates
@@ -2159,11 +2180,20 @@ section_header(
     "Optimizasyon sonucu",
     "Önerilen servis planının temel performans göstergelerini ve güzergâh detaylarını inceleyin.",
 )
+if result.get("pedestrian_verified"):
+    st.success(
+        f"Gerçek yaya yolunda doğrulandı: en uzun yürüyüş "
+        f"{result.get('max_network_walk_m', 0):.0f} m, "
+        f"ortalama {result.get('avg_network_walk_m', 0):.0f} m. "
+        "Hiçbir çalışan 1.000 m üzerinde yürümeye atanmamıştır."
+    )
 for warning in result.get("warnings", []):
-    if "Yol ağı verisi kullanılamadı" in warning:
-        st.warning("Gerçek yol verisine ulaşılamadı; rota yaklaşık mesafeyle hesaplandı.")
-    elif "maksimum rota süresini aşıyor" in warning:
-        st.warning("Bazı rotalar belirlenen azami rota süresini aşıyor.")
+    if "Yaya yol ağı doğrulaması:" in warning:
+        continue  # already displayed in result summary
+    if "OTOMATİK ANA YOL" in warning or "OSRM driving profili" in warning:
+        st.warning(warning)
+    else:
+        st.caption("ℹ️ " + warning)
 
 if result.get("same_route_morning_evening"):
     max_morning = float(result.get("max_morning_minutes", 0.0))
@@ -2185,6 +2215,7 @@ automatic_stop_sources = {
     "Otomatik ortak nokta",
     "Güzergâh üzeri aday durak",
     "Güzergâha yakın yeni durak",
+    "Ana yol adayı (saha kontrolü gerekli)",
 }
 automatic_stop_count = sum(
     stop.get("source") in automatic_stop_sources
@@ -2245,7 +2276,7 @@ with st.expander("Teknik optimizasyon ayrıntıları", expanded=False):
     else:
         t1.metric("Değerlendirilen aday durak", result.get("candidate_count", 0))
         t2.metric(
-            "Kanıtlanmış minimum" if result.get("minimum_proven") else "Bulunan en iyi alt plan",
+            "Seçilen fiziksel durak",
             result.get("minimum_stop_count", 0),
         )
         t3.metric("Çoklu ortak durak", multi_stop_count)

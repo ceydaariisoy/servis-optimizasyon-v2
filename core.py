@@ -41,10 +41,10 @@ MAX_FALLBACK_CORRIDOR_SEGMENT_KM = 4.0
 # - Tek kişilik otomatik duraklar mümkün olduğunca azaltılır.
 # - Aynı mevcut rota koridoruna ait durakların aynı serviste kalması teşvik edilir.
 # - Kusursuz doluluk dengesi uğruna gereksiz bölgesel çaprazlama yapılmaz.
-REGIONAL_SWITCH_PENALTY_SECONDS = 420
+REGIONAL_SWITCH_PENALTY_SECONDS = 700
 SINGLE_AUTOMATIC_ROUTE_PENALTY_SECONDS = 240
 DETOUR_ROUTE_PENALTY_SECONDS = 180
-BALANCE_TOLERANCE_PASSENGERS = 3
+BALANCE_TOLERANCE_PASSENGERS = 5
 COMFORT_EXTRA_STOP_LIMIT = 3
 COMFORT_MIN_TOTAL_IMPROVEMENT_M = 120.0
 
@@ -2097,7 +2097,20 @@ def assign_common_stops_to_routes(
         return [[] for _ in range(vehicle_count)]
 
     if any(stop.passenger_count > capacity for stop in stops):
-        raise ValueError("Bir ortak durağın yolcu sayısı araç kapasitesini aşıyor.")
+        expanded = []
+        for stop in stops:
+            pairs = list(zip(stop.member_indices, stop.walking_distances_m))
+            for first in range(0, len(pairs), capacity):
+                chunk = pairs[first:first + capacity]
+                expanded.append(CommonStop(
+                    anchor_index=stop.anchor_index,
+                    member_indices=[p[0] for p in chunk],
+                    walking_distances_m=[p[1] for p in chunk],
+                    latitude=stop.latitude, longitude=stop.longitude,
+                    label=stop.label, source=stop.source,
+                    matrix_index=stop.matrix_index, route_group=stop.route_group,
+                ))
+        stops = expanded
 
     stop_matrix_indices = [
         stop.matrix_index
@@ -2265,7 +2278,7 @@ def assign_common_stops_to_routes(
         ),
     )
 
-    balance_penalty = 1500
+    balance_penalty = 400
 
     for vehicle_no in range(vehicle_count):
         end_index = routing.End(vehicle_no)
@@ -2304,7 +2317,7 @@ def assign_common_stops_to_routes(
     )
 
     # Uzun tek bir rota oluşmasını engelle; fakat bölgesel maliyetler de etkili kalsın.
-    time_dimension.SetGlobalSpanCostCoefficient(4)
+    time_dimension.SetGlobalSpanCostCoefficient(15)
 
     parameters = pywrapcp.DefaultRoutingSearchParameters()
 
