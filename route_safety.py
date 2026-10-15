@@ -140,31 +140,160 @@ def qualifies_on_main_road(point, segments: list[RoadSegment], max_distance_m=40
     return any(_project_to_segment(point, s.a, s.b)[1] <= max_distance_m for s in segments)
 
 
-def propose_major_road_stops(employees, segments, existing, limit_per_employee=6):
-    """Suggest sampled road-center candidate points; require field approval to operate.
+def propose_major_road_stops(
+    employees,
+    segments,
+    existing,
+    limit_per_employee=6,
+    max_total_candidates=200,
+):
+    """Generate a *bounded, coverage-aware* shortlist of road-center stops.
 
-    Only OSM primary/secondary/tertiary roads. Avoid home-front stops within 100m.
-    Points at road centrelines require relocation to safe curbside before operations.
+    The former implementation collected up to six candidates per employee and
+    hard-failed once the union exceeded 350. With ~80 staff that is common.
+
+    Here we protect every approved stop, first cover employees using a greedy
+    shared-stop heuristic, and then spend the remaining candidate budget on
+    nearby alternatives. The pedestrian NETWORK later decides what is truly
+    reachable: no crow-fly distance is used to approve an assignment.
+
+    Suggested coordinates represent road centrelines, not approved bus stops.
+    A safe kerbside location must be checked before field use.
     """
-    samples = {}
-    for s in segments:
-        length = haversine_m(s.a, s.b)
-        steps = max(1, math.ceil(length / 220))
-        for i in range(steps+1):
-            p = (s.a[0]+(s.b[0]-s.a[0])*i/steps, s.a[1]+(s.b[1]-s.a[1])*i/steps)
-            key = (round(p[0], 5), round(p[1], 5))
-            samples[key] = (p, s.name)
-    candidates = dict(existing)
-    for employee in employees:
-        nearby = sorted(
-            ((haversine_m(employee, point), key, point, road_name) for key, (point, road_name) in samples.items()
-             if 110 <= haversine_m(employee, point) <= MAX_WALK_METERS), key=lambda x: x[0]
+    existing = dict(existing)
+    max_total_candidates = max(1, int(max_total_candidates))
+    if len(existing) > max_total_candidates:
+        raise ValidationError(
+            f"Onaylı durak sayısı ({len(existing)}) aday sınırından "
+            f"({max_total_candidates}) fazla; önce sınırı artırın veya "
+            "kapsamı daraltın. Onaylı duraklar otomatik silinmedi."
         )
-        for _, key, p, road_name in nearby[:limit_per_employee]:
-            candidates.setdefault(key, (p[0], p[1], f"{road_name} — otomatik ana yol adayı", "", AUTO_STOP_SOURCE))
-    if len(candidates) > 350:
-        raise ValidationError("Aday durak sayısı çok yüksek; kent/bölge bazında ayrı plan oluşturun.")
-    return list(candidates.values())
+    if not employees:
+        return list(existing.values())
+
+    # Sample each permitted OSM main-road segment approximately every 220 m.
+    samples = {}
+    for segment in segments:
+        length = haversine_m(segment.a, segment.b)
+        steps = max(1, math.ceil(length / 220))
+        for step in range(steps + 1):
+            point = (
+                segment.a[0] + (segment.b[0] - segment.a[0]) * step / steps,
+                segment.a[1] + (segment.b[1] - segment.a[1]) * step / steps,
+            )
+            key = (round(point[0], 5), round(point[1], 5))
+            if key not in existing:
+                samples.setdefault(key, (point, segment.name))
+
+    # Only collect locally relevant sample keys; avoid unlimited candidates
+    # for urban corridors where many parallel main roads are nearby.
+    per_employee = []
+    distance_lookup = {}
+    pool = set()
+    for employee_index, employee in enumerate(employees):
+        shortlist = []
+        for key, (point, _road_name) in samples.items():
+            distance_m = haversine_m(employee, point)
+            if 110 <= distance_m <= MAX_WALK_METERS:
+                shortlist.append((distance_m, key))
+        shortlist.sort(key=lambda item: (item[0], item[1]))
+        shortlist = shortlist[:max(1, int(limit_per_employee))]
+        per_employee.append(shortlist)
+        for distance_m, key in shortlist:
+            pool.add(key)
+            distance_lookup[(employee_index, key)] = distance_m
+
+    selected = dict(existing)
+    covered = set()
+    for employee_index, employee in enumerate(employees):
+        if any(haversine_m(employee, (record[0], record[1])) <= MAX_WALK_METERS
+               for record in selected.values()):
+            covered.add(employee_index)
+
+    # A stop can serve several colleagues. Greedy coverage avoids producing
+    # a new unique stop for each employee merely to bypass an arbitrary cap.
+    reverse_coverage = defaultdict(set)
+    for employee_index, shortlist in enumerate(per_employee):
+        for _, key in shortlist:
+            reverse_coverage[key].add(employee_index)
+    remaining = set(range(len(employees))) - covered
+    available = set(pool)
+    while remaining and available and len(selected) < max_total_candidates:
+        best = None
+        best_key = None
+        for key in available:
+            newly_covered = reverse_coverage[key] & remaining
+            if not newly_covered:
+                continue
+            walks = [distance_lookup[(i, key)] for i in newly_covered]
+            priority = (len(newly_covered), -sum(walks) / len(walks), -min(walks))
+            if best is None or priority > best or (priority == best and key < best_key):
+                best = priority
+                best_key = key
+        if best_key is None:
+            break
+        point, name = samples[best_key]
+        selected[best_key] = (
+            point[0], point[1], f"{name} — otomatik ana yol adayı", "", AUTO_STOP_SOURCE
+        )
+        remaining -= reverse_coverage[best_key]
+        available.remove(best_key)
+
+    # Do not hide uncovered staff: when geometry cannot even offer a nearby
+    # road-center candidate we must ask for a different approved safe stop.
+    # The final decision still requires a successful foot-road distance.
+    if remaining:
+        indices = ', '.join(str(i + 1) for i in sorted(remaining)[:20])
+        if len(selected) >= max_total_candidates and any(per_employee[i] for i in remaining):
+            raise ValidationError(
+                f"Aday durak havuzu {max_total_candidates} sınırına ulaştı ve "
+                f"{len(remaining)} çalışan için kapsama tamamlanamadı "
+                f"(satırlar: {indices}). Aday limitini kontrollü artırın "
+                "veya ulaşım bölgesini ayrı değerlendirin; 1000 m sınırı korunur."
+            )
+        raise ValidationError(
+            f"{len(remaining)} çalışan için 1000 m kuş uçuşu sınırında dahi "
+            f"uygun ana yol adayı bulunamadı (çalışan satırları: {indices}). "
+            "Güvenli yeni durak veya farklı yol verisi gerekiyor."
+        )
+
+    # Add independent near-by choices to protect against bridges, barriers,
+    # roundabout detours and disconnected footpaths. We DO NOT treat these
+    # aerial approximations as proven pedestrian distances.
+    def choices_count(employee_index):
+        employee = employees[employee_index]
+        return sum(
+            haversine_m(employee, (row[0], row[1])) <= MAX_WALK_METERS
+            for row in selected.values()
+        )
+
+    # Round-robin favours the least-served employee first. Up to three
+    # distinct nearby choices are useful for post-network verification.
+    for desired_choices in (2, 3):
+        if len(selected) >= max_total_candidates:
+            break
+        order = sorted(range(len(employees)), key=lambda i: (choices_count(i), i))
+        for employee_index in order:
+            if len(selected) >= max_total_candidates:
+                break
+            if choices_count(employee_index) >= desired_choices:
+                continue
+            for _distance, key in per_employee[employee_index]:
+                if key in selected:
+                    continue
+                # Prefer a geometrically distinct alternative; otherwise the
+                # foot router could return the same inaccessible road branch.
+                if any(haversine_m(samples[key][0], (row[0], row[1])) < 90
+                       for row in selected.values()
+                       if haversine_m(employees[employee_index], (row[0], row[1])) <= MAX_WALK_METERS):
+                    continue
+                point, name = samples[key]
+                selected[key] = (
+                    point[0], point[1], f"{name} — otomatik ana yol adayı", "", AUTO_STOP_SOURCE
+                )
+                break
+
+    return list(selected.values())
 
 
 def candidates_on_arterials(employees, approved_candidates, allow_automatic=True, road_segments=None):
