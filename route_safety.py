@@ -11,6 +11,7 @@ from collections import defaultdict
 from functools import lru_cache
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 import json
 import math
 import os
@@ -44,15 +45,66 @@ class ValidationError(ValueError):
     """A hard safety rule cannot be satisfied or verified."""
 
 
+def _service_name(url: str) -> str:
+    """Distinguish OSM road discovery from pedestrian-distance errors."""
+    if '/interpreter' in url or 'overpass' in url.lower():
+        return "Ana yol harita servisi (Overpass)"
+    if '/table/v1/' in url:
+        return "Yaya yolu mesafe servisi (OSRM foot)"
+    return "Harita servisi"
+
+
 def _request_json(url: str, data: bytes | None = None) -> dict:
-    request = Request(url, data=data, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    if data is not None:
-        request.add_header("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-    try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        raise ValidationError(f"Harita/yaya yolu servisi kullanılamıyor: {exc}") from exc
+    """Retry short transient outages, fail closed when verification is impossible.
+
+    No HTTP response is interpreted as proof that a worker can walk to a stop.
+    The calling routine is responsible for enforcing <=1000 m on actual foot
+    network distances. A low retry cap avoids hammering public map servers.
+    """
+    service = _service_name(url)
+    attempts = 3
+    for attempt in range(attempts):
+        request = Request(url, data=data, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        if data is not None:
+            request.add_header("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+        try:
+            with urlopen(request, timeout=REQUEST_TIMEOUT_S) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not isinstance(result, dict):
+                raise ValidationError(f"{service}: Sunucu beklenen JSON nesnesini döndürmedi.")
+            return result
+        except HTTPError as exc:
+            status = exc.code
+            temporary = status in {429, 500, 502, 503, 504}
+            if temporary and attempt < attempts - 1:
+                # Avoid rapid repeated requests to community-hosted services.
+                retry_after = exc.headers.get('Retry-After', '') if exc.headers else ''
+                try:
+                    delay = max(1.5 * (attempt + 1), float(retry_after))
+                except (TypeError, ValueError):
+                    delay = 1.5 * (attempt + 1)
+                time.sleep(min(delay, 8.0))
+                continue
+            guidance = (
+                "Dış servis geçici olarak yanıt veremiyor. Birkaç dakika sonra yeniden deneyin; "
+                "tekrarlıyorsa kurumsal / özel harita sunucusu kullanın. "
+                "1.000 m sınırı gevşetilmedi, doğrulanmamış rota üretilmedi."
+                if temporary else
+                "Hizmet adresini ve erişim yetkilerini kontrol edin."
+            )
+            raise ValidationError(f"{service}: HTTP {status}. {guidance}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise ValidationError(
+                f"{service}: Bağlantı kurulamadı veya zaman aşımı oluştu ({type(exc).__name__}). "
+                "Bir süre sonra yeniden deneyin veya yetkili bir harita sunucusuna geçin. "
+                "Yaklaşık yürüme mesafesiyle atama yapılmadı."
+            ) from exc
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValidationError(f"{service}: Sunucu geçerli JSON yanıtı döndürmedi.") from exc
+    raise ValidationError(f"{service}: Servis yanıtı alınamadı.")
 
 
 def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -302,6 +354,20 @@ def candidates_on_arterials(employees, approved_candidates, allow_automatic=True
     Uploaded stops must already have a positive Saha_Onayi in the Excel parser.
     """
     approved_candidates = approved_candidates or []
+    # Explicit approved-only mode does not need an Overpass lookup. Here the
+    # user uploads stops already validated by the field team; using those
+    # verified physical stops is preferable to failing solely because the
+    # community OSM road-classification API is down. The pedestrian foot
+    # network check remains compulsory and has no estimated-distance fallback.
+    if not allow_automatic and road_segments is None:
+        records = [
+            (float(row[0]), float(row[1]), str(row[2]),
+             str(row[3]) if len(row) > 3 else "", APPROVED_STOP_SOURCE)
+            for row in approved_candidates if len(row) >= 3
+        ]
+        if not records:
+            raise ValidationError("Yalnızca saha onaylı duraklar modunda onaylı durak yüklemelisiniz.")
+        return records, []
     points = [(float(p[0]), float(p[1])) for p in approved_candidates if len(p) >= 2]
     segments = road_segments if road_segments is not None else fetch_major_roads(employees, points)
     existing = {}

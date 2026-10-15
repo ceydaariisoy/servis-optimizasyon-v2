@@ -28,7 +28,7 @@ from route_safety import (
 )
 
 
-APP_VERSION = "2026.10-major-road-pedestrian-v1"
+APP_VERSION = "2026.10-major-road-pedestrian-v1.2-502-recovery"
 FIXED_TARGET_AVERAGE_WALK_M = 400
 FIXED_WAIT_SECONDS_PER_STOP = 15
 MORNING_FACTORY_ARRIVAL_SECONDS = 7 * 3600 + 55 * 60
@@ -1628,6 +1628,12 @@ def build_shared_routes(
     )
     if excluded_roads:
         warnings.append(f"Ana yol kontrolünü geçmeyen {len(excluded_roads)} yüklenen durak elendi.")
+    if not allow_automatic_candidates:
+        warnings.append(
+            "Yalnızca saha onaylı duraklar kullanıldı. Overpass ana yol sınıfı servisi "
+            "çağrılmadı; araç uygunluğu saha onayına dayanır. Gerçek yaya ağı ve "
+            "1.000 m sınırı yine zorunlu olarak kontrol edilir."
+        )
     if any(stop.source.startswith("Ana yol adayı") for stop in all_stops):
         warnings.append(
             "OTOMATİK ANA YOL NOKTALARI SADECE ÖNERİDİR. Kaldırım, güvenli bekleme "
@@ -1642,7 +1648,7 @@ def build_shared_routes(
         "candidate_count": len(candidates),
         "joint_objective_proven": joint_objective_proven,
         "pedestrian_verified": True,
-        "road_class_screened": True,
+        "road_class_screened": bool(allow_automatic_candidates),
         "max_network_walk_m": experience_meta["max_walk_m"],
         "avg_network_walk_m": experience_meta["avg_walk_m"],
         "minimum_stop_count": minimum_stop_count,
